@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Reescribe el texto seleccionado con IA (Claude o Codex).
+
+Uso: seleccionar texto en cualquier app, pulsar el atajo global.
+Copia la selección con Ctrl+C simulado (ydotool), muestra una ventana con
+botones de tono, y permite copiar el resultado o reemplazar la selección
+original (Ctrl+V simulado).
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+
+CONFIG = Path.home() / ".config" / "rewrite-text.json"
+
+# El atajo global de GNOME arranca con un PATH mínimo: añadimos donde viven claude y codex
+_extra = [str(Path.home() / ".local" / "bin")]
+_nvm = Path.home() / ".nvm" / "versions" / "node"
+if _nvm.is_dir():
+    _extra += [str(d / "bin") for d in sorted(_nvm.iterdir(), reverse=True)]
+os.environ["PATH"] = ":".join(_extra + [os.environ.get("PATH", "/usr/bin:/bin")])
+
+TONES = [
+    ("Profesional", "profesional y cortés, claro y directo"),
+    ("Amigable", "cercano y amigable, natural, sin sonar forzado"),
+    ("Más corto", "lo mismo pero más conciso, sin perder información"),
+    ("Corregir", "idéntico en tono y contenido, solo corrigiendo ortografía, gramática y puntuación"),
+    ("Inglés", "traducido al inglés en tono profesional natural"),
+]
+
+BACKENDS = ["claude", "codex"]
+
+PROMPT = (
+    "Eres un asistente que reescribe mensajes cortos de chat de trabajo (Teams). "
+    "Reescribe el mensaje siguiente en tono {tone}. "
+    "Mantén el mismo idioma del original (salvo que se pida traducir), el mismo significado "
+    "y el formato de chat (breve, sin encabezados). "
+    "Responde ÚNICAMENTE con el texto reescrito, sin comillas, sin explicaciones, sin alternativas.\n\n"
+    "Mensaje:\n{text}"
+)
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        CONFIG.write_text(json.dumps(cfg, indent=2))
+    except Exception:
+        pass
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def clipboard_get():
+    r = run(["wl-paste", "-n"])
+    return r.stdout if r.returncode == 0 else ""
+
+
+def clipboard_set(text):
+    subprocess.run(["wl-copy", "--", text], check=False)
+
+
+def release_modifiers():
+    """Suelta los modificadores del atajo global.
+
+    Al pulsar Super+R la tecla Super sigue fisicamente pulsada cuando enviamos
+    Ctrl+C, y el resultado seria Super+Ctrl+C (que no copia). Enviamos keyup de
+    todos los modificadores antes de simular nada.
+    """
+    # 125 LEFTMETA, 126 RIGHTMETA, 29 LEFTCTRL, 97 RIGHTCTRL,
+    # 42 LEFTSHIFT, 54 RIGHTSHIFT, 56 LEFTALT, 100 RIGHTALT
+    run(["ydotool", "key"] + [f"{k}:0" for k in
+        (125, 126, 29, 97, 42, 54, 56, 100)])
+    time.sleep(0.12)
+
+
+def grab_selection():
+    """Ctrl+C simulado y lectura del portapapeles. Devuelve (texto, portapapeles_previo)."""
+    previous = clipboard_get()
+    release_modifiers()
+    # 29 = LEFTCTRL, 46 = C  (keycodes de evdev)
+    run(["ydotool", "key", "29:1", "46:1", "46:0", "29:0"])
+    text = ""
+    for _ in range(12):
+        time.sleep(0.08)
+        text = clipboard_get()
+        if text and text != previous:
+            break
+    if not text or text == previous:
+        # Fallback: selección primaria (funciona en GTK y XWayland)
+        r = run(["wl-paste", "-p", "-n"])
+        text = r.stdout if r.returncode == 0 else ""
+    return text.strip(), previous
+
+
+def paste_back():
+    release_modifiers()
+    # 29 = LEFTCTRL, 47 = V
+    run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
+
+
+def rewrite(backend, tone_desc, text):
+    prompt = PROMPT.format(tone=tone_desc, text=text)
+    # Directorio vacío como cwd: así no se carga AGENTS.md/CLAUDE.md ni memoria del proyecto
+    with tempfile.TemporaryDirectory() as tmp:
+        if backend == "codex":
+            # --output-last-message da la respuesta limpia, sin cabeceras ni razonamiento
+            last = os.path.join(tmp, "out.txt")
+            cmd = ["codex", "exec", "--ephemeral", "--skip-git-repo-check",
+                   "-s", "read-only", "-C", tmp, "-o", last, "--color", "never", prompt]
+        else:
+            last = None
+            cmd = ["claude", "-p", "--model", "haiku", prompt]
+        r = run(cmd, cwd=tmp, timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip()[-400:] or f"{backend} falló")
+        if last and os.path.exists(last):
+            out = Path(last).read_text().strip()
+        else:
+            out = r.stdout.strip()
+    if not out:
+        raise RuntimeError(f"{backend} no devolvió texto")
+    return out.strip('"').strip()
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, text, previous_clip):
+        super().__init__(application=app, title="Reescribir", default_width=560, default_height=460)
+        self.previous_clip = previous_clip
+        self.cfg = load_config()
+
+        tv = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        self.backend = Gtk.DropDown.new_from_strings(BACKENDS)
+        self.backend.set_selected(BACKENDS.index(self.cfg.get("backend", "claude")))
+        header.pack_end(self.backend)
+        tv.add_top_bar(header)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                      margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
+
+        box.append(Gtk.Label(label="Original", xalign=0, css_classes=["dim-label"]))
+        self.src = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=6, bottom_margin=6,
+                                left_margin=6, right_margin=6)
+        self.src.get_buffer().set_text(text)
+        box.append(self._scrolled(self.src, 90))
+
+        tones = Gtk.Box(spacing=6, homogeneous=True)
+        for label, desc in TONES:
+            b = Gtk.Button(label=label)
+            b.connect("clicked", self.on_tone, desc)
+            tones.append(b)
+        box.append(tones)
+
+        self.status = Gtk.Label(label="Resultado", xalign=0, css_classes=["dim-label"])
+        box.append(self.status)
+        self.dst = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=6, bottom_margin=6,
+                                left_margin=6, right_margin=6)
+        box.append(self._scrolled(self.dst, 140))
+
+        actions = Gtk.Box(spacing=6, halign=Gtk.Align.END)
+        self.btn_copy = Gtk.Button(label="Copiar", sensitive=False)
+        self.btn_copy.connect("clicked", self.on_copy)
+        self.btn_replace = Gtk.Button(label="Reemplazar", sensitive=False, css_classes=["suggested-action"])
+        self.btn_replace.connect("clicked", self.on_replace)
+        actions.append(self.btn_copy)
+        actions.append(self.btn_replace)
+        box.append(actions)
+
+        tv.set_content(box)
+        self.set_content(tv)
+
+        esc = Gtk.ShortcutController()
+        esc.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("Escape"),
+                                          Gtk.CallbackAction.new(lambda *a: self.close())))
+        self.add_controller(esc)
+
+        if not text:
+            self.status.set_label("No se detectó texto seleccionado; pégalo arriba y elige un tono.")
+
+    @staticmethod
+    def _scrolled(view, height):
+        sw = Gtk.ScrolledWindow(min_content_height=height, vexpand=True, css_classes=["card"])
+        sw.set_child(view)
+        return sw
+
+    def _text(self, view):
+        b = view.get_buffer()
+        return b.get_text(b.get_start_iter(), b.get_end_iter(), True)
+
+    def on_tone(self, _btn, tone_desc):
+        text = self._text(self.src).strip()
+        if not text:
+            return
+        backend = BACKENDS[self.backend.get_selected()]
+        self.cfg["backend"] = backend
+        save_config(self.cfg)
+        self.status.set_label(f"Reescribiendo con {backend}…")
+        self.set_sensitive(False)
+
+        def work():
+            try:
+                out = rewrite(backend, tone_desc, text)
+                GLib.idle_add(self.done, out, None)
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self.done, None, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def done(self, out, err):
+        self.set_sensitive(True)
+        if err:
+            self.status.set_label(f"Error: {err}")
+            return
+        self.dst.get_buffer().set_text(out)
+        self.status.set_label("Resultado")
+        self.btn_copy.set_sensitive(True)
+        self.btn_replace.set_sensitive(True)
+        self.btn_replace.grab_focus()
+
+    def on_copy(self, _b):
+        clipboard_set(self._text(self.dst))
+        self.close()
+
+    def on_replace(self, _b):
+        clipboard_set(self._text(self.dst))
+        # Guardar la referencia a la app ANTES de cerrar: una vez destruida la
+        # ventana, get_application() devuelve None.
+        self.app = self.get_application()
+        # hold() es imprescindible: sin el, cerrar la ultima ventana termina el
+        # bucle principal y el timeout del pegado no llega a dispararse nunca.
+        self.app.hold()
+        self.close()
+        # Al cerrar, el foco vuelve a la app anterior; pegamos encima de la selección
+        GLib.timeout_add(450, self._paste_and_quit)
+
+    def _paste_and_quit(self):
+        paste_back()
+        # Margen para que wl-copy sirva el portapapeles antes de que salgamos
+        GLib.timeout_add(300, self._quit)
+        return False
+
+    def _quit(self):
+        self.app.release()
+        self.app.quit()
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self, text, previous_clip):
+        super().__init__(application_id="dev.carlos.RewriteText")
+        self.text, self.previous_clip = text, previous_clip
+
+    def do_activate(self):
+        Window(self, self.text, self.previous_clip).present()
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--stdin":
+        text, prev = sys.stdin.read().strip(), ""
+    else:
+        text, prev = grab_selection()
+    App(text, prev).run([])
+
+
+if __name__ == "__main__":
+    main()
