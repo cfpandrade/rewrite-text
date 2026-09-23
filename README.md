@@ -22,8 +22,30 @@ atajo global es el equivalente funcional y funciona en todas partes por igual.
 5. **Reemplazar** sustituye el texto original con un `Ctrl+V` simulado,
    **Copiar** lo deja solo en el portapapeles y `Esc` cancela.
 
+Si el tono ya lo tienes decidido, los atajos directos se saltan la ventana entera.
+
 El motor se elige en el desplegable de la barra de titulo y la preferencia se
 guarda en `~/.config/rewrite-text.json`.
+
+## Atajos directos por tono
+
+Para los dos tonos de uso diario no hace falta pasar por la ventana:
+
+| Atajo | Efecto |
+| --- | --- |
+| `Ctrl+Super+P` | reescribe en **profesional** y reemplaza la seleccion |
+| `Ctrl+Super+F` | reescribe en **amigable** y reemplaza la seleccion |
+
+Seleccionas, pulsas, y unos segundos despues el texto original queda sustituido.
+No hay confirmacion: si el resultado no convence, `Ctrl+Z` en la aplicacion de
+origen devuelve el texto anterior. Los errores (sin seleccion, motor caido) se
+avisan con una notificacion del escritorio, asi que conviene tener `notify-send`
+disponible: `sudo apt install libnotify-bin`.
+
+Por debajo es el mismo script con `--direct <tono>`, donde el tono es uno de
+`professional`, `friendly`, `short`, `fix` o `english`. Para anadir otro tono basta
+con registrar un atajo nuevo que llame a `rewrite-text --direct short`. El motor en
+modo directo es el ultimo que se eligiera en la ventana.
 
 ## Requisitos
 
@@ -43,10 +65,13 @@ cd rewrite-text
 ```
 
 El instalador copia el script a `~/.local/bin`, activa el demonio `ydotoold` y
-registra el atajo. Para usar otra combinacion:
+registra los tres atajos. Para usar otras combinaciones:
 
 ```sh
-BINDING='<Super><Shift>r' ./install.sh
+BINDING='<Super><Shift>r' \
+BINDING_PROFESSIONAL='<Control><Super>p' \
+BINDING_FRIENDLY='<Control><Super>f' \
+./install.sh
 ```
 
 ## Detalles de implementacion

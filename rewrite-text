@@ -5,10 +5,14 @@ Uso: seleccionar texto en cualquier app, pulsar el atajo global.
 Copia la selección con Ctrl+C simulado (ydotool), muestra una ventana con
 botones de tono, y permite copiar el resultado o reemplazar la selección
 original (Ctrl+V simulado).
+
+Con `--direct <tono>` salta la ventana: reescribe con ese tono y reemplaza la
+selección directamente, pensado para atajos por tono (Ctrl+Super+P, Ctrl+Super+F).
 """
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -32,12 +36,13 @@ if _nvm.is_dir():
 os.environ["PATH"] = ":".join(_extra + [os.environ.get("PATH", "/usr/bin:/bin")])
 
 TONES = [
-    ("Profesional", "profesional y cortés, claro y directo"),
-    ("Amigable", "cercano y amigable, natural, sin sonar forzado"),
-    ("Más corto", "lo mismo pero más conciso, sin perder información"),
-    ("Corregir", "idéntico en tono y contenido, solo corrigiendo ortografía, gramática y puntuación"),
-    ("Inglés", "traducido al inglés en tono profesional natural"),
+    ("professional", "Profesional", "profesional y cortés, claro y directo"),
+    ("friendly", "Amigable", "cercano y amigable, natural, sin sonar forzado"),
+    ("short", "Más corto", "lo mismo pero más conciso, sin perder información"),
+    ("fix", "Corregir", "idéntico en tono y contenido, solo corrigiendo ortografía, gramática y puntuación"),
+    ("english", "Inglés", "traducido al inglés en tono profesional natural"),
 ]
+TONE_BY_SLUG = {slug: (label, desc) for slug, label, desc in TONES}
 
 BACKENDS = ["claude", "codex"]
 
@@ -46,6 +51,7 @@ PROMPT = (
     "Reescribe el mensaje siguiente en tono {tone}. "
     "Mantén el mismo idioma del original (salvo que se pida traducir), el mismo significado "
     "y el formato de chat (breve, sin encabezados). "
+    "PROHIBIDO usar guiones largos (—) o medios (–): usa comas, puntos, dos puntos o paréntesis. "
     "Responde ÚNICAMENTE con el texto reescrito, sin comillas, sin explicaciones, sin alternativas.\n\n"
     "Mensaje:\n{text}"
 )
@@ -117,6 +123,19 @@ def paste_back():
     run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
 
 
+def notify(message, urgency="normal"):
+    """Feedback para el modo directo, que no tiene ventana donde mostrar errores."""
+    run(["notify-send", "-a", "Reescribir texto", "-u", urgency,
+         "Reescribir texto", message])
+
+
+def strip_ai_dashes(text):
+    """El prompt ya los prohíbe, pero el modelo recae: aquí no pasa ninguno."""
+    text = re.sub(r"(?<=\d)\s*[—–]\s*(?=\d)", "-", text)
+    text = re.sub(r"\s*[—–]\s*", ", ", text)
+    return re.sub(r",\s*,", ",", text)
+
+
 def rewrite(backend, tone_desc, text):
     prompt = PROMPT.format(tone=tone_desc, text=text)
     # Directorio vacío como cwd: así no se carga AGENTS.md/CLAUDE.md ni memoria del proyecto
@@ -138,7 +157,7 @@ def rewrite(backend, tone_desc, text):
             out = r.stdout.strip()
     if not out:
         raise RuntimeError(f"{backend} no devolvió texto")
-    return out.strip('"').strip()
+    return strip_ai_dashes(out.strip('"').strip())
 
 
 class Window(Adw.ApplicationWindow):
@@ -164,7 +183,7 @@ class Window(Adw.ApplicationWindow):
         box.append(self._scrolled(self.src, 90))
 
         tones = Gtk.Box(spacing=6, homogeneous=True)
-        for label, desc in TONES:
+        for _slug, label, desc in TONES:
             b = Gtk.Button(label=label)
             b.connect("clicked", self.on_tone, desc)
             tones.append(b)
@@ -273,7 +292,31 @@ class App(Adw.Application):
         Window(self, self.text, self.previous_clip).present()
 
 
+def direct_rewrite(tone_slug):
+    """Reescribe y reemplaza la selección sin abrir ventana."""
+    if tone_slug not in TONE_BY_SLUG:
+        sys.exit(f"Tono desconocido: {tone_slug}. Opciones: {', '.join(TONE_BY_SLUG)}")
+    label, desc = TONE_BY_SLUG[tone_slug]
+    text, _ = grab_selection()
+    if not text:
+        notify("No se detectó texto seleccionado.", "critical")
+        return
+    backend = load_config().get("backend", "claude")
+    try:
+        out = rewrite(backend, desc, text)
+    except Exception as e:  # noqa: BLE001
+        notify(f"Error en «{label}»: {e}", "critical")
+        return
+    clipboard_set(out)
+    paste_back()
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--direct":
+        if len(sys.argv) < 3:
+            sys.exit(f"Uso: rewrite-text --direct <{'|'.join(TONE_BY_SLUG)}>")
+        direct_rewrite(sys.argv[2])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--stdin":
         text, prev = sys.stdin.read().strip(), ""
     else:
