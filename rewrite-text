@@ -40,8 +40,7 @@ os.environ["PATH"] = ":".join(_extra + [os.environ.get("PATH", "/usr/bin:/bin")]
 
 TONES = [
     ("professional", "Profesional", "profesional y cortés, claro y directo"),
-    ("friendly", "Amigable", "muy cercano y amigable, natural, con un toque de humor sutil y salero "
-     "(un pelín de guasa, sin pasarse ni forzar el chiste), sin sonar forzado"),
+    ("friendly", "Amigable", "cercano y amigable, natural, sin sonar forzado"),
     ("short", "Más corto", "lo mismo pero más conciso, sin perder información"),
     ("fix", "Corregir", "idéntico en tono y contenido, solo corrigiendo ortografía, gramática y puntuación"),
     ("english", "Inglés", "traducido al inglés en tono profesional natural"),
