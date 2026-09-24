@@ -8,6 +8,9 @@ original (Ctrl+V simulado).
 
 Con `--direct <tono>` salta la ventana: reescribe con ese tono y reemplaza la
 selección directamente, pensado para atajos por tono (Ctrl+Super+P, Ctrl+Super+F).
+
+Con `--direct-cli` convierte la selección (una petición en lenguaje natural)
+en un comando de shell y lo pega, pensado para terminales (Ctrl+Super+C).
 """
 
 import json
@@ -54,6 +57,14 @@ PROMPT = (
     "PROHIBIDO usar guiones largos (—) o medios (–): usa comas, puntos, dos puntos o paréntesis. "
     "Responde ÚNICAMENTE con el texto reescrito, sin comillas, sin explicaciones, sin alternativas.\n\n"
     "Mensaje:\n{text}"
+)
+
+CLI_PROMPT = (
+    "Eres un asistente que convierte una petición en lenguaje natural en un comando de shell "
+    "(bash, en Linux) que la resuelve. Si hacen falta varios pasos, encadénalos con && en una "
+    "sola línea. Responde ÚNICAMENTE con el comando, en una sola línea, sin explicaciones, "
+    "sin comillas envolventes, sin backticks ni bloques de código markdown.\n\n"
+    "Petición:\n{text}"
 )
 
 
@@ -123,6 +134,15 @@ def paste_back():
     run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
 
 
+def paste_back_terminal():
+    """Como paste_back() pero para terminales (kitty incluida): Ctrl+V ahí lo
+    interpreta readline como "insertar literal", no como pegar. El atajo de
+    pegado estándar en terminales es Ctrl+Shift+V."""
+    release_modifiers()
+    # 29 = LEFTCTRL, 42 = LEFTSHIFT, 47 = V
+    run(["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
+
+
 def notify(message, urgency="normal"):
     """Feedback para el modo directo, que no tiene ventana donde mostrar errores."""
     run(["notify-send", "-a", "Reescribir texto", "-u", urgency,
@@ -136,8 +156,7 @@ def strip_ai_dashes(text):
     return re.sub(r",\s*,", ",", text)
 
 
-def rewrite(backend, tone_desc, text):
-    prompt = PROMPT.format(tone=tone_desc, text=text)
+def ask_backend(backend, prompt):
     # Directorio vacío como cwd: así no se carga AGENTS.md/CLAUDE.md ni memoria del proyecto
     with tempfile.TemporaryDirectory() as tmp:
         if backend == "codex":
@@ -157,7 +176,22 @@ def rewrite(backend, tone_desc, text):
             out = r.stdout.strip()
     if not out:
         raise RuntimeError(f"{backend} no devolvió texto")
+    return out.strip()
+
+
+def rewrite(backend, tone_desc, text):
+    prompt = PROMPT.format(tone=tone_desc, text=text)
+    out = ask_backend(backend, prompt)
     return strip_ai_dashes(out.strip('"').strip())
+
+
+def to_command(backend, text):
+    prompt = CLI_PROMPT.format(text=text)
+    out = ask_backend(backend, prompt)
+    # El prompt ya lo prohíbe, pero el modelo a veces envuelve el comando en
+    # backticks o un bloque ```bash ... ``` pese a la instrucción.
+    out = re.sub(r"^```[a-zA-Z]*\n?|```$", "", out.strip()).strip()
+    return out.strip('`').strip('"').strip()
 
 
 class Window(Adw.ApplicationWindow):
@@ -308,10 +342,37 @@ def direct_rewrite(tone_slug):
         notify(f"Error en «{label}»: {e}", "critical")
         return
     clipboard_set(out)
+    # Margen para que wl-copy se registre como dueño del portapapeles antes de pegar
+    time.sleep(0.45)
     paste_back()
+    # Margen para que wl-copy siga sirviendo el portapapeles antes de que el proceso termine
+    time.sleep(0.3)
+
+
+def direct_command():
+    """Convierte la selección (petición en lenguaje natural) en un comando de
+    shell y lo pega en su lugar, pensado para terminales como kitty. Solo
+    pega: nunca pulsa Enter, para que el comando se revise antes de correrlo."""
+    text, _ = grab_selection()
+    if not text:
+        notify("No se detectó texto seleccionado.", "critical")
+        return
+    backend = load_config().get("backend", "claude")
+    try:
+        out = to_command(backend, text)
+    except Exception as e:  # noqa: BLE001
+        notify(f"Error generando el comando: {e}", "critical")
+        return
+    clipboard_set(out)
+    time.sleep(0.45)
+    paste_back_terminal()
+    time.sleep(0.3)
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--direct-cli":
+        direct_command()
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--direct":
         if len(sys.argv) < 3:
             sys.exit(f"Uso: rewrite-text --direct <{'|'.join(TONE_BY_SLUG)}>")

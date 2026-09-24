@@ -8,6 +8,7 @@ MEDIA_KEYS="org.gnome.settings-daemon.plugins.media-keys"
 BINDING="${BINDING:-<Super>r}"
 BINDING_PROFESSIONAL="${BINDING_PROFESSIONAL:-<Control><Super>p}"
 BINDING_FRIENDLY="${BINDING_FRIENDLY:-<Control><Super>f}"
+BINDING_CLI="${BINDING_CLI:-<Control><Super>c}"
 
 registrar_atajo() {
   local slug="$1" nombre="$2" comando="$3" combinacion="$4"
@@ -66,9 +67,12 @@ registrar_atajo rewrite-text-professional 'Reescribir texto: profesional (direct
   "$BIN_DIR/rewrite-text --direct professional" "$BINDING_PROFESSIONAL"
 registrar_atajo rewrite-text-friendly 'Reescribir texto: amigable (directo)' \
   "$BIN_DIR/rewrite-text --direct friendly" "$BINDING_FRIENDLY"
+registrar_atajo rewrite-text-cli 'Reescribir texto: comando de shell (directo)' \
+  "$BIN_DIR/rewrite-text --direct-cli" "$BINDING_CLI"
 
 echo
 echo "Listo. Selecciona texto en cualquier app y pulsa:"
 echo "  $BINDING -> ventana con todos los tonos"
 echo "  $BINDING_PROFESSIONAL -> reescribe en profesional y reemplaza"
 echo "  $BINDING_FRIENDLY -> reescribe en amigable y reemplaza"
+echo "  $BINDING_CLI -> convierte la selección en un comando de shell y lo pega (pensado para terminales)"
