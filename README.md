@@ -84,10 +84,18 @@ Tres cosas que no son evidentes y que hacen falta para que esto funcione:
   crear una propia: dos demonios a la vez se pelean por el socket y acaban
   duplicando las pulsaciones.
 
-- **Soltar los modificadores.** Al dispararse el atajo, la tecla `Super` sigue
-  fisicamente pulsada cuando el script envia el `Ctrl+C`. El resultado seria
-  `Super+Ctrl+C`, que no copia nada. Por eso se envia un *keyup* de todos los
-  modificadores antes de simular cualquier combinacion.
+- **Esperar a que se suelte el atajo.** Al dispararse el atajo, la tecla `Super`
+  sigue fisicamente pulsada; un `Ctrl+C` simulado saldria como `Super+Ctrl+C`.
+  Enviar un *keyup* falso de `Super` no sirve: GNOME lo toma como pulsar y soltar
+  `Super`, abre Actividades (el texto parpadea al perder el foco) y el estado de
+  modificadores queda desincronizado, asi que a veces se escribe una `v` o una `c`
+  en vez de pegar. El script lee el estado real del teclado con `python3-evdev`
+  (hace falta estar en el grupo `input`) y espera a que no haya teclas pulsadas.
+
+- **Comprobar la seleccion antes de pegar.** La IA tarda unos segundos. Si
+  entretanto se mueve el cursor, pegar a ciegas duplica el texto o lo mete en otro
+  sitio. Antes de pegar se vuelve a copiar la seleccion y, si ya no es el texto
+  original, el resultado se deja en el portapapeles y se avisa con una notificacion.
 
 - **Mantener viva la aplicacion para poder pegar.** Una `Gtk.Application` sale del
   bucle principal en cuanto se destruye su ultima ventana. Cerrar la ventana y

@@ -34,6 +34,7 @@ command -v ydotool  >/dev/null || missing+=(ydotool)
 command -v wl-copy  >/dev/null || missing+=(wl-clipboard)
 python3 -c 'import gi; gi.require_version("Gtk","4.0"); gi.require_version("Adw","1")' 2>/dev/null \
   || missing+=(python3-gi gir1.2-gtk-4.0 gir1.2-adw-1)
+python3 -c 'import evdev' 2>/dev/null || missing+=(python3-evdev)
 if ((${#missing[@]})); then
   echo "Faltan paquetes. Instalalos con:"
   echo "  sudo apt install ${missing[*]}"
@@ -43,6 +44,14 @@ fi
 echo "==> Instalando el script en $BIN_DIR"
 mkdir -p "$BIN_DIR"
 install -m 755 "$(dirname "$0")/rewrite-text" "$BIN_DIR/rewrite-text"
+
+ZSH_WIDGET="$HOME/.local/share/rewrite-text/rewrite-text.zsh"
+echo "==> Instalando el widget de zsh (Alt+E) en $ZSH_WIDGET"
+install -D -m 644 "$(dirname "$0")/rewrite-text.zsh" "$ZSH_WIDGET"
+if [[ -f "$HOME/.zshrc" ]] && ! grep -qF "$ZSH_WIDGET" "$HOME/.zshrc"; then
+  printf '\n# rewrite-text: Alt+E corrige la linea o el ultimo comando fallido\n[[ -r "%s" ]] && source "%s"\n' \
+    "$ZSH_WIDGET" "$ZSH_WIDGET" >> "$HOME/.zshrc"
+fi
 
 echo "==> Activando el demonio ydotoold"
 # ydotoold abre /dev/uinput, que es root:input 0660. Sin pertenecer al grupo la
@@ -76,3 +85,5 @@ echo "  $BINDING -> ventana con todos los tonos"
 echo "  $BINDING_PROFESSIONAL -> reescribe en profesional y reemplaza"
 echo "  $BINDING_FRIENDLY -> reescribe en amigable y reemplaza"
 echo "  $BINDING_CLI -> convierte la selección en un comando de shell y lo pega (pensado para terminales)"
+echo "En zsh (abre una terminal nueva):"
+echo "  Alt+E -> corrige la línea escrita, o el último comando si la línea está vacía"

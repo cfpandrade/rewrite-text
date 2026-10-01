@@ -31,6 +31,10 @@ from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
 
 CONFIG = Path.home() / ".config" / "rewrite-text.json"
 
+# Modelo fijo para codex: si no, hereda el de ~/.codex/config.toml, que puede no
+# estar disponible (400 "model not supported"). Se puede cambiar con "codex_model".
+CODEX_MODEL = "gpt-6-luna"
+
 # El atajo global de GNOME arranca con un PATH mínimo: añadimos donde viven claude y codex
 _extra = [str(Path.home() / ".local" / "bin")]
 _nvm = Path.home() / ".nvm" / "versions" / "node"
@@ -52,10 +56,14 @@ BACKENDS = ["claude", "codex"]
 PROMPT = (
     "Eres un asistente que reescribe mensajes cortos de chat de trabajo (Teams). "
     "Reescribe el mensaje siguiente en tono {tone}. "
-    "Mantén el mismo idioma del original (salvo que se pida traducir), el mismo significado "
-    "y el formato de chat (breve, sin encabezados). "
+    "Mantén el mismo significado y el formato de chat (breve, sin encabezados). "
     "PROHIBIDO usar guiones largos (—) o medios (–): usa comas, puntos, dos puntos o paréntesis. "
     "Responde ÚNICAMENTE con el texto reescrito, sin comillas, sin explicaciones, sin alternativas.\n\n"
+    # Estas instrucciones están en español y el modelo tiende a contestar en
+    # español aunque el mensaje no lo esté: la regla del idioma va al final y explícita.
+    "IDIOMA: responde en el MISMO idioma en que está escrito el mensaje (si está en inglés, "
+    "en inglés; si está en español, en español), nunca en el idioma de estas instrucciones, "
+    "salvo que el tono pida traducir.\n\n"
     "Mensaje:\n{text}"
 )
 
@@ -65,6 +73,24 @@ CLI_PROMPT = (
     "sola línea. Responde ÚNICAMENTE con el comando, en una sola línea, sin explicaciones, "
     "sin comillas envolventes, sin backticks ni bloques de código markdown.\n\n"
     "Petición:\n{text}"
+)
+
+SHELL_LINE_PROMPT = (
+    "Tienes una línea escrita en una terminal (zsh en Linux, directorio actual: {cwd}). "
+    "Si es un comando con errores (typos, flags o sintaxis incorrectos), devuélvelo corregido. "
+    "Si ya es correcto, devuélvelo tal cual. Si es una petición en lenguaje natural, "
+    "conviértela en el comando que la resuelve. Si hacen falta varios pasos, encadénalos "
+    "con && en una sola línea. Responde ÚNICAMENTE con el comando, en una sola línea, sin "
+    "explicaciones, sin comillas envolventes, sin backticks ni bloques de código markdown.\n\n"
+    "Línea:\n{text}"
+)
+
+SHELL_FIX_PROMPT = (
+    "Este comando se ejecutó en zsh (Linux, directorio actual: {cwd}) y terminó con código "
+    "{status}.\n\nComando:\n{text}\n\nSalida del comando:\n{output}\n\n"
+    "Devuelve el comando corregido para que haga lo que se pretendía. Responde ÚNICAMENTE "
+    "con el comando, en una sola línea, sin explicaciones, sin comillas envolventes, sin "
+    "backticks ni bloques de código markdown."
 )
 
 
@@ -82,13 +108,29 @@ def save_config(cfg):
         pass
 
 
+LOG = Path.home() / ".cache" / "rewrite-text.log"
+
+
+def log(msg):
+    """Traza de cada paso: lanzado desde un atajo no hay terminal donde ver qué falla."""
+    try:
+        with LOG.open("a") as f:
+            f.write(f"{time.strftime('%F %T')} [{os.getpid()}] {msg}\n")
+    except OSError:
+        pass
+
+
 def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
 def clipboard_get():
-    r = run(["wl-paste", "-n"])
-    return r.stdout if r.returncode == 0 else ""
+    # Pedimos solo texto: si el portapapeles tiene una imagen, wl-paste falla en
+    # vez de devolver bytes binarios que reventarían el decode a UTF-8.
+    r = subprocess.run(["wl-paste", "-n", "-t", "text"], capture_output=True)
+    if r.returncode != 0:
+        return ""
+    return r.stdout.decode("utf-8", errors="replace")
 
 
 def clipboard_set(text):
@@ -96,11 +138,10 @@ def clipboard_set(text):
 
 
 def release_modifiers():
-    """Suelta los modificadores del atajo global.
+    """Último recurso si no se puede leer el teclado: keyup falso de los modificadores.
 
-    Al pulsar Super+R la tecla Super sigue fisicamente pulsada cuando enviamos
-    Ctrl+C, y el resultado seria Super+Ctrl+C (que no copia). Enviamos keyup de
-    todos los modificadores antes de simular nada.
+    Tiene efectos secundarios (soltar Super abre Actividades), por eso solo se
+    usa cuando wait_keys_released() no puede hacer su trabajo.
     """
     # 125 LEFTMETA, 126 RIGHTMETA, 29 LEFTCTRL, 97 RIGHTCTRL,
     # 42 LEFTSHIFT, 54 RIGHTSHIFT, 56 LEFTALT, 100 RIGHTALT
@@ -109,12 +150,61 @@ def release_modifiers():
     time.sleep(0.12)
 
 
+def wait_keys_released(timeout=3.0):
+    """Espera a que el usuario suelte físicamente todas las teclas.
+
+    Si simulamos Ctrl+C con Super o Ctrl del atajo aún pulsadas sale otra
+    combinación; y falsificar sus keyup desincroniza el estado de mutter
+    (Actividades que se abre y cierra, letras sueltas en vez de pegar).
+    """
+    try:
+        import evdev
+        from evdev import ecodes
+    except ImportError:
+        release_modifiers()
+        return
+
+    keyboards = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            continue
+        if ecodes.KEY_A in dev.capabilities().get(ecodes.EV_KEY, []):
+            keyboards.append(dev)
+        else:
+            dev.close()
+    if not keyboards:
+        release_modifiers()
+        return
+
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            # Por debajo de BTN_MISC solo hay teclas: se ignoran botones de ratón
+            held = [k for d in keyboards for k in d.active_keys() if k < ecodes.BTN_MISC]
+            if not held:
+                break
+            if time.monotonic() > deadline:
+                release_modifiers()
+                break
+            time.sleep(0.02)
+    finally:
+        for dev in keyboards:
+            dev.close()
+    time.sleep(0.05)
+
+
+def press_copy():
+    wait_keys_released()
+    # 29 = LEFTCTRL, 46 = C  (keycodes de evdev)
+    run(["ydotool", "key", "29:1", "46:1", "46:0", "29:0"])
+
+
 def grab_selection():
     """Ctrl+C simulado y lectura del portapapeles. Devuelve (texto, portapapeles_previo)."""
     previous = clipboard_get()
-    release_modifiers()
-    # 29 = LEFTCTRL, 46 = C  (keycodes de evdev)
-    run(["ydotool", "key", "29:1", "46:1", "46:0", "29:0"])
+    press_copy()
     text = ""
     for _ in range(12):
         time.sleep(0.08)
@@ -125,11 +215,13 @@ def grab_selection():
         # Fallback: selección primaria (funciona en GTK y XWayland)
         r = run(["wl-paste", "-p", "-n"])
         text = r.stdout if r.returncode == 0 else ""
+        log(f"portapapeles sin cambios, selección primaria: {len(text)} caracteres")
+    log(f"selección capturada: {len(text.strip())} caracteres")
     return text.strip(), previous
 
 
 def paste_back():
-    release_modifiers()
+    wait_keys_released()
     # 29 = LEFTCTRL, 47 = V
     run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
 
@@ -138,15 +230,66 @@ def paste_back_terminal():
     """Como paste_back() pero para terminales (kitty incluida): Ctrl+V ahí lo
     interpreta readline como "insertar literal", no como pegar. El atajo de
     pegado estándar en terminales es Ctrl+Shift+V."""
-    release_modifiers()
+    wait_keys_released()
     # 29 = LEFTCTRL, 42 = LEFTSHIFT, 47 = V
     run(["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
+
+
+PROBE = "⁣rewrite-text-probe⁣"
+
+
+def selection_unchanged(original):
+    """Vuelve a copiar para saber si la selección original sigue ahí.
+
+    La IA tarda unos segundos; si entretanto se movió el cursor o cambió el
+    foco, pegar a ciegas duplicaría el texto o lo metería en otro sitio.
+    """
+    if not original:
+        return False
+    clipboard_set(PROBE)
+    time.sleep(0.1)
+    press_copy()
+    current = PROBE
+    for _ in range(10):
+        time.sleep(0.08)
+        current = clipboard_get()
+        if current and current != PROBE:
+            break
+    return current.strip() == original.strip()
+
+
+def replace_selection(result, original):
+    """Pega el resultado sobre la selección solo si sigue siendo la original."""
+    if not selection_unchanged(original):
+        log("la selección cambió: resultado solo en el portapapeles")
+        clipboard_set(result)
+        notify("La selección cambió mientras se reescribía. "
+               "El resultado está en el portapapeles: pégalo con Ctrl+V.")
+        return
+    clipboard_set(result)
+    # Margen para que wl-copy se registre como dueño del portapapeles antes de pegar
+    time.sleep(0.45)
+    log("pegando con Ctrl+V")
+    paste_back()
 
 
 def notify(message, urgency="normal"):
     """Feedback para el modo directo, que no tiene ventana donde mostrar errores."""
     run(["notify-send", "-a", "Reescribir texto", "-u", urgency,
          "Reescribir texto", message])
+
+
+def notify_progress(message):
+    r = run(["notify-send", "--print-id", "-e", "-u", "low", "-a", "Reescribir texto",
+             "Reescribir texto", message])
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def notify_close(nid):
+    if nid:
+        run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+             "--object-path", "/org/freedesktop/Notifications",
+             "--method", "org.freedesktop.Notifications.CloseNotification", nid])
 
 
 def strip_ai_dashes(text):
@@ -162,12 +305,15 @@ def ask_backend(backend, prompt):
         if backend == "codex":
             # --output-last-message da la respuesta limpia, sin cabeceras ni razonamiento
             last = os.path.join(tmp, "out.txt")
+            model = load_config().get("codex_model", CODEX_MODEL)
             cmd = ["codex", "exec", "--ephemeral", "--skip-git-repo-check",
-                   "-s", "read-only", "-C", tmp, "-o", last, "--color", "never", prompt]
+                   "-m", model, "-s", "read-only", "-C", tmp, "-o", last, "--color", "never", prompt]
         else:
             last = None
             cmd = ["claude", "-p", "--model", "haiku", prompt]
+        log(f"llamando a {backend}")
         r = run(cmd, cwd=tmp, timeout=120)
+        log(f"{backend} terminó con código {r.returncode}")
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout).strip()[-400:] or f"{backend} falló")
         if last and os.path.exists(last):
@@ -185,8 +331,7 @@ def rewrite(backend, tone_desc, text):
     return strip_ai_dashes(out.strip('"').strip())
 
 
-def to_command(backend, text):
-    prompt = CLI_PROMPT.format(text=text)
+def ask_command(backend, prompt):
     out = ask_backend(backend, prompt)
     # El prompt ya lo prohíbe, pero el modelo a veces envuelve el comando en
     # backticks o un bloque ```bash ... ``` pese a la instrucción.
@@ -194,10 +339,49 @@ def to_command(backend, text):
     return out.strip('`').strip('"').strip()
 
 
+def to_command(backend, text):
+    return ask_command(backend, CLI_PROMPT.format(text=text))
+
+
+def shell_mode(args):
+    """Para el widget de zsh: imprime el comando corregido por stdout.
+
+    `--shell LINEA` corrige la línea o convierte la petición en comando.
+    `--shell --status N COMANDO` corrige un comando que ya falló; la salida
+    que produjo (si la hay) llega por stdin.
+    """
+    status = None
+    if args[:1] == ["--status"]:
+        if len(args) < 2:
+            sys.exit("Uso: rewrite-text --shell [--status N] [--] COMANDO")
+        status, args = args[1], args[2:]
+    if args[:1] == ["--"]:
+        args = args[1:]
+    text = " ".join(args).strip()
+    if not text:
+        sys.exit("No hay comando que corregir.")
+
+    cwd = os.getcwd()
+    if status is None:
+        prompt = SHELL_LINE_PROMPT.format(cwd=cwd, text=text)
+    else:
+        output = "" if sys.stdin.isatty() else sys.stdin.read()
+        # Lo último es lo que importa: el error suele estar al final
+        output = output.strip()[-3000:] or "(no disponible)"
+        prompt = SHELL_FIX_PROMPT.format(cwd=cwd, status=status, text=text, output=output)
+
+    backend = load_config().get("backend", "claude")
+    try:
+        print(ask_command(backend, prompt))
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"Error ({backend}): {e}")
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app, text, previous_clip):
         super().__init__(application=app, title="Reescribir", default_width=560, default_height=460)
         self.previous_clip = previous_clip
+        self.original = text
         self.cfg = load_config()
 
         tv = Adw.ToolbarView()
@@ -294,7 +478,7 @@ class Window(Adw.ApplicationWindow):
         self.close()
 
     def on_replace(self, _b):
-        clipboard_set(self._text(self.dst))
+        self.result = self._text(self.dst)
         # Guardar la referencia a la app ANTES de cerrar: una vez destruida la
         # ventana, get_application() devuelve None.
         self.app = self.get_application()
@@ -306,7 +490,7 @@ class Window(Adw.ApplicationWindow):
         GLib.timeout_add(450, self._paste_and_quit)
 
     def _paste_and_quit(self):
-        paste_back()
+        replace_selection(self.result, self.original)
         # Margen para que wl-copy sirva el portapapeles antes de que salgamos
         GLib.timeout_add(300, self._quit)
         return False
@@ -336,15 +520,15 @@ def direct_rewrite(tone_slug):
         notify("No se detectó texto seleccionado.", "critical")
         return
     backend = load_config().get("backend", "claude")
+    nid = notify_progress(f"{label}: reescribiendo…")
     try:
         out = rewrite(backend, desc, text)
     except Exception as e:  # noqa: BLE001
+        notify_close(nid)
         notify(f"Error en «{label}»: {e}", "critical")
         return
-    clipboard_set(out)
-    # Margen para que wl-copy se registre como dueño del portapapeles antes de pegar
-    time.sleep(0.45)
-    paste_back()
+    notify_close(nid)
+    replace_selection(out, text)
     # Margen para que wl-copy siga sirviendo el portapapeles antes de que el proceso termine
     time.sleep(0.3)
 
@@ -358,11 +542,14 @@ def direct_command():
         notify("No se detectó texto seleccionado.", "critical")
         return
     backend = load_config().get("backend", "claude")
+    nid = notify_progress("Generando comando…")
     try:
         out = to_command(backend, text)
     except Exception as e:  # noqa: BLE001
+        notify_close(nid)
         notify(f"Error generando el comando: {e}", "critical")
         return
+    notify_close(nid)
     clipboard_set(out)
     time.sleep(0.45)
     paste_back_terminal()
@@ -370,6 +557,10 @@ def direct_command():
 
 
 def main():
+    log(f"inicio: {' '.join(sys.argv[1:]) or '(ventana)'}")
+    if len(sys.argv) > 1 and sys.argv[1] == "--shell":
+        shell_mode(sys.argv[2:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--direct-cli":
         direct_command()
         return
