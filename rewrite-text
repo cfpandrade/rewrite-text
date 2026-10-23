@@ -55,17 +55,71 @@ BACKENDS = ["claude", "codex"]
 
 PROMPT = (
     "Eres un asistente que reescribe mensajes cortos de chat de trabajo (Teams). "
-    "Reescribe el mensaje siguiente en tono {tone}. "
+    "Reescribe el mensaje que va entre <mensaje> y </mensaje> en tono {tone}. "
     "Mantén el mismo significado y el formato de chat (breve, sin encabezados). "
     "PROHIBIDO usar guiones largos (—) o medios (–): usa comas, puntos, dos puntos o paréntesis. "
-    "Responde ÚNICAMENTE con el texto reescrito, sin comillas, sin explicaciones, sin alternativas.\n\n"
+    "Responde ÚNICAMENTE con el texto reescrito entre <respuesta> y </respuesta>, sin comillas, "
+    "sin explicaciones fuera de las etiquetas, sin alternativas.\n\n"
     # Estas instrucciones están en español y el modelo tiende a contestar en
     # español aunque el mensaje no lo esté: la regla del idioma va al final y explícita.
-    "IDIOMA: responde en el MISMO idioma en que está escrito el mensaje (si está en inglés, "
-    "en inglés; si está en español, en español), nunca en el idioma de estas instrucciones, "
-    "salvo que el tono pida traducir.\n\n"
-    "Mensaje:\n{text}"
+    "{language}\n\n"
+    "<mensaje>\n{text}\n</mensaje>"
 )
+
+LANGUAGE_RULE = (
+    "IDIOMA: el mensaje está escrito en {lang}. Tu respuesta tiene que estar ENTERA en {lang}, "
+    "aunque estas instrucciones estén en español. No traduzcas nada. {native}"
+)
+# La misma orden en el propio idioma del mensaje: el modelo la respeta mucho más
+NATIVE_RULE = {
+    "español": "",
+    "inglés": "Reply in English only.",
+    "francés": "Réponds uniquement en français.",
+    "italiano": "Rispondi solo in italiano.",
+    "portugués": "Responda apenas em português.",
+    "alemán": "Antworte nur auf Deutsch.",
+}
+LANGUAGE_RULE_UNKNOWN = (
+    "IDIOMA: responde en el MISMO idioma en que está escrito el mensaje (si está en inglés, "
+    "en inglés; si está en español, en español), nunca en el idioma de estas instrucciones. "
+    "No traduzcas nada."
+)
+LANGUAGE_RULE_TRANSLATE = "IDIOMA: tu respuesta tiene que estar ENTERA en inglés."
+
+# Palabras muy frecuentes de cada idioma: bastan para distinguirlos en mensajes cortos
+# sin depender de una librería de detección.
+STOPWORDS = {
+    "español": "el la los las un una de del que y en es por para con no se lo al pero como "
+               "más mas este esta esto eso ya muy hay sí si te me mi tu su nos le les estoy "
+               "puedes puedo gracias hola mañana hoy bueno vale porque cuando también donde "
+               "listo hecho claro perfecto",
+    "inglés": "the a an and of to in is are was it that this for with on be not you i we "
+              "they he she have has will can could would should do does did at from by "
+              "please thanks hi hey so but if or my your our just ok sure done yes got will "
+              "let me know call meeting",
+    "francés": "le la les un une des du de et est que qui pour pas ne je tu il nous vous "
+               "avec sur dans ce cette merci bonjour mais ou très bien",
+    "italiano": "il lo la gli le un una di che e è per non con sono ho hai mi ti ci grazie "
+                "ciao anche ma come questo questa domani perché",
+    "portugués": "o a os as um uma de do da que e é em para com não se eu você nós obrigado "
+                 "olá mas como isso este esta muito também",
+    "alemán": "der die das und ist nicht ich du wir sie ein eine zu mit auf für von den dem "
+              "es auch danke hallo bitte aber wie",
+}
+STOPWORDS = {lang: set(words.split()) for lang, words in STOPWORDS.items()}
+
+
+def detect_language(text):
+    """Idioma del texto por recuento de palabras frecuentes, o None si no está claro."""
+    words = re.findall(r"[^\W\d_]+", text.lower())
+    scores = sorted(((sum(w in sw for w in words), lang) for lang, sw in STOPWORDS.items()),
+                    reverse=True)
+    (best, lang), (second, _) = scores[0], scores[1]
+    # Empate o mezcla sin idioma dominante: mejor la regla genérica
+    if best >= 1 and best >= 1.5 * second:
+        return lang
+    return None
+
 
 CLI_PROMPT = (
     "Eres un asistente que convierte una petición en lenguaje natural en un comando de shell "
@@ -325,9 +379,25 @@ def ask_backend(backend, prompt):
     return out.strip()
 
 
+def extract_answer(out):
+    """Solo lo de dentro de <respuesta>: haiku a veces antepone su razonamiento."""
+    m = re.search(r"<respuesta>\s*(.*?)\s*(?:</respuesta>|$)", out, re.S)
+    return m.group(1) if m else out
+
+
 def rewrite(backend, tone_desc, text):
-    prompt = PROMPT.format(tone=tone_desc, text=text)
-    out = ask_backend(backend, prompt)
+    lang = detect_language(text)
+    log(f"idioma detectado: {lang or 'dudoso'}")
+    if "traducido" in tone_desc:
+        language = LANGUAGE_RULE_TRANSLATE
+    else:
+        language = LANGUAGE_RULE.format(lang=lang, native=NATIVE_RULE[lang]).strip() if lang else LANGUAGE_RULE_UNKNOWN
+    prompt = PROMPT.format(tone=tone_desc, language=language, text=text)
+    out = extract_answer(ask_backend(backend, prompt))
+    # Si aun así cambia de idioma (o cuela su razonamiento en español), un reintento
+    if lang and "traducido" not in tone_desc and detect_language(out) not in (lang, None):
+        log(f"respuesta en {detect_language(out)}, reintentando")
+        out = extract_answer(ask_backend(backend, prompt))
     return strip_ai_dashes(out.strip('"').strip())
 
 
